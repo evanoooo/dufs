@@ -553,11 +553,16 @@ impl Server {
     }
 
     async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> Result<()> {
+        let path_str = path.to_string_lossy().to_string();
+        let final_path = if is_dir && !path_str.ends_with('/') && !path_str.ends_with('\\') {
+            format!("{}\\", path_str)
+        } else {
+            path_str
+        };
         match is_dir {
-            true => fs::remove_dir_all(path).await?,
-            false => fs::remove_file(path).await?,
+            true => fs::remove_dir(final_path).await?,
+            false => fs::remove_file(final_path).await?,
         }
-
         status_no_content(res);
         Ok(())
     }
@@ -909,8 +914,8 @@ impl Server {
                         let range_size = end - start + 1;
                         let content_range = format!("bytes {start}-{end}/{size}");
                         let part_header = format!(
-                            "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: {content_range}\r\n\r\n",
-                        );
+                                "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: {content_range}\r\n\r\n",
+                            );
                         body.extend_from_slice(part_header.as_bytes());
                         let mut buffer = vec![0; range_size as usize];
                         file.read_exact(&mut buffer).await?;
@@ -1093,8 +1098,16 @@ impl Server {
     }
 
     async fn handle_mkcol(&self, path: &Path, res: &mut Response) -> Result<()> {
-        fs::create_dir_all(path).await?;
-        *res.status_mut() = StatusCode::CREATED;
+        // 1. 检查路径是否存在
+        if tokio::fs::metadata(path).await.is_ok() {
+            // 如果已存在，直接返回成功（通常 201 Created 或 204 No Content）
+            // 这里沿用 CREATED，或者根据你的需求改为 StatusCode::NO_CONTENT
+            *res.status_mut() = StatusCode::CREATED;
+        } else {
+            // 2. 不存在则创建
+            fs::create_dir_all(path).await?;
+            *res.status_mut() = StatusCode::CREATED;
+        }
         Ok(())
     }
 
