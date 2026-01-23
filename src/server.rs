@@ -555,7 +555,8 @@ impl Server {
     async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> Result<()> {
         let path_str = path.to_string_lossy().to_string();
         let final_path = if is_dir && !path_str.ends_with('/') && !path_str.ends_with('\\') {
-            format!("{}\\", path_str)
+            info!("handle_delete: {path_str}");
+            format!("{}/", path_str)
         } else {
             path_str
         };
