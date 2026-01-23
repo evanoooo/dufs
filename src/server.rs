@@ -460,8 +460,8 @@ impl Server {
                     if !allow_upload {
                         status_forbid(&mut res);
                     } else if !is_miss {
-                        *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                        *res.body_mut() = body_full("Already exists");
+                        // *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                        // *res.body_mut() = body_full("Already exists");
                     } else {
                         self.handle_mkcol(path, &mut res).await?;
                     }
