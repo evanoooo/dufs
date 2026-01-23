@@ -460,8 +460,8 @@ impl Server {
                     if !allow_upload {
                         status_forbid(&mut res);
                     } else if !is_miss {
-                        // *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                        // *res.body_mut() = body_full("Already exists");
+                        *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                        *res.body_mut() = body_full("Already exists");
                     } else {
                         self.handle_mkcol(path, &mut res).await?;
                     }
@@ -1099,16 +1099,9 @@ impl Server {
     }
 
     async fn handle_mkcol(&self, path: &Path, res: &mut Response) -> Result<()> {
-        // 1. 检查路径是否存在
-        if tokio::fs::metadata(path).await.is_ok() {
-            // 如果已存在，直接返回成功（通常 201 Created 或 204 No Content）
-            // 这里沿用 CREATED，或者根据你的需求改为 StatusCode::NO_CONTENT
-            *res.status_mut() = StatusCode::CREATED;
-        } else {
-            // 2. 不存在则创建
-            fs::create_dir_all(path).await?;
-            *res.status_mut() = StatusCode::CREATED;
-        }
+        // 2. 不存在则创建
+        fs::create_dir_all(path).await?;
+        *res.status_mut() = StatusCode::CREATED;
         Ok(())
     }
 
