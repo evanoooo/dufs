@@ -89,15 +89,6 @@ pub fn build_cli() -> Command {
                 .value_name("rules"),
         )
         .arg(
-            Arg::new("token")
-                .env("DUFS_TOKEN")
-				.hide_env(true)
-                .long("token")
-                .help("Add static access tokens, e.g. uuid-token-string")
-                .action(ArgAction::Append)
-                .value_name("tokens"),
-        )
-        .arg(
             Arg::new("auth-method")
                 .hide(true)
                 .env("DUFS_AUTH_METHOD")
@@ -292,8 +283,6 @@ pub struct Args {
     pub hidden: Vec<String>,
     #[serde(deserialize_with = "deserialize_access_control")]
     pub auth: AccessControl,
-    #[serde(deserialize_with = "deserialize_tokens", default)]
-    pub tokens: Vec<String>,
     pub allow_all: bool,
     pub allow_upload: bool,
     pub allow_delete: bool,
@@ -328,11 +317,6 @@ impl Args {
                 .with_context(|| format!("Failed to read config at {}", config_path.display()))?;
             args = serde_yaml::from_str(&contents)
                 .with_context(|| format!("Failed to load config at {}", config_path.display()))?;
-
-            let auth_rules = matches.get_many::<String>("auth").map(|v| v.map(|s| s.as_str()).collect::<Vec<_>>()).unwrap_or_default();
-            let tokens = &args.tokens;
-            args.auth = AccessControl::new(&auth_rules, tokens)
-                .with_context(|| "Failed to parse auth configuration")?;
         }
 
         if let Some(path) = matches.get_one::<PathBuf>("serve-path") {
@@ -379,13 +363,7 @@ impl Args {
 
         if let Some(rules) = matches.get_many::<String>("auth") {
             let rules: Vec<_> = rules.map(|v| v.as_str()).collect();
-            let tokens: Vec<String> = matches.get_many::<String>("token")
-                .map(|v| v.map(|s| s.to_string()).collect())
-                .unwrap_or_default();
-            args.auth = AccessControl::new(&rules, &tokens)?;
-        } else if let Some(tokens) = matches.get_many::<String>("token") {
-            let tokens: Vec<String> = tokens.map(|s| s.to_string()).collect();
-            args.auth = AccessControl::new(&[], &tokens)?;
+            args.auth = AccessControl::new(&rules)?;
         }
 
         if !args.allow_all {
@@ -631,14 +609,7 @@ where
     D: Deserializer<'de>,
 {
     let rules: Vec<&str> = Vec::deserialize(deserializer)?;
-    AccessControl::new(&rules, &[]).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_tokens<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Vec::deserialize(deserializer)
+    AccessControl::new(&rules).map_err(serde::de::Error::custom)
 }
 
 fn deserialize_log_http<'de, D>(deserializer: D) -> Result<HttpLogger, D::Error>

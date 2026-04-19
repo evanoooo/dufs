@@ -34,7 +34,6 @@ pub struct AccessControl {
     use_hashed_password: bool,
     users: IndexMap<String, (String, AccessPaths)>,
     anonymous: Option<AccessPaths>,
-    tokens: IndexMap<String, AccessPaths>,
 }
 
 impl Default for AccessControl {
@@ -44,14 +43,13 @@ impl Default for AccessControl {
             use_hashed_password: false,
             users: IndexMap::new(),
             anonymous: Some(AccessPaths::new(AccessPerm::ReadWrite)),
-            tokens: IndexMap::new(),
         }
     }
 }
 
 impl AccessControl {
-    pub fn new(raw_rules: &[&str], token_rules: &[String]) -> Result<Self> {
-        if raw_rules.is_empty() && token_rules.is_empty() {
+    pub fn new(raw_rules: &[&str]) -> Result<Self> {
+        if raw_rules.is_empty() {
             return Ok(Self::default());
         }
         let new_raw_rules = split_rules(raw_rules);
@@ -96,30 +94,11 @@ impl AccessControl {
             users.insert(user.to_string(), (pass.to_string(), access_paths));
         }
 
-        let mut tokens = IndexMap::new();
-        for rule in token_rules {
-            let (token, paths) = rule
-                .split_once('@')
-                .ok_or_else(|| anyhow!("Invalid token `{rule}`, expected format: token@/path:rw"))?;
-            if token.is_empty() || paths.is_empty() {
-                bail!("Invalid token `{rule}`");
-            }
-            let mut access_paths = AccessPaths::default();
-            access_paths
-                .merge(paths)
-                .ok_or_else(|| anyhow!("Invalid token paths `{rule}`"))?;
-            if let Some(anon_paths) = &anonymous {
-                access_paths.merge_paths(anon_paths);
-            }
-            tokens.insert(token.to_string(), access_paths);
-        }
-
         Ok(Self {
             empty: false,
             use_hashed_password,
             users,
             anonymous,
-            tokens,
         })
     }
 
@@ -141,9 +120,6 @@ impl AccessControl {
 
         if method == Method::GET {
             if let Some(token) = token {
-                if let Some(ap) = self.tokens.get(token) {
-                    return (None, ap.guard(path, method));
-                }
                 if let Ok((user, ap)) = self.verify_token(token, path) {
                     return (Some(user), ap.guard(path, method));
                 }
@@ -260,29 +236,6 @@ impl AccessPaths {
             self.add(path, perm);
         }
         Some(())
-    }
-
-    pub fn merge_paths(&mut self, other: &AccessPaths) {
-        self.merge_from(other, "");
-    }
-
-    fn merge_from(&mut self, other: &AccessPaths, path: &str) {
-        if !other.perm.indexonly() {
-            let current_path = if path.is_empty() {
-                "/".to_string()
-            } else {
-                format!("/{}", path.trim_end_matches('/'))
-            };
-            self.merge(&format!("{}:{}", current_path, if other.perm.readwrite() { "rw" } else { "ro" }));
-        }
-        for (name, child) in &other.children {
-            let child_path = if path.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", path, name)
-            };
-            self.merge_from(child, &child_path);
-        }
     }
 
     pub fn guard(&self, path: &str, method: &Method) -> Option<Self> {
