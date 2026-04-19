@@ -230,7 +230,7 @@ impl Server {
         }
 
         if has_query_flag(&query_params, "tokengen") {
-            self.handle_tokengen(&relative_path, user, &mut res).await?;
+            self.handle_tokengen(&relative_path, user, &query_params, &mut res).await?;
             return Ok(res);
         }
 
@@ -1030,12 +1030,17 @@ impl Server {
         &self,
         relative_path: &str,
         user: Option<String>,
+        query_params: &HashMap<String, String>,
         res: &mut Response,
     ) -> Result<()> {
+        let expiration = query_params
+            .get("exp")
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| query_params.get("ttl").and_then(|v| v.parse::<u64>().ok()));
         let output = self
             .args
             .auth
-            .generate_token(relative_path, &user.unwrap_or_default())?;
+            .generate_token(relative_path, &user.unwrap_or_default(), expiration)?;
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_PLAIN_UTF_8));
         res.headers_mut()

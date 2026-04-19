@@ -152,12 +152,16 @@ impl AccessControl {
         (None, None)
     }
 
-    pub fn generate_token(&self, path: &str, user: &str) -> Result<String> {
+    pub fn generate_token(&self, path: &str, user: &str, expiration: Option<u64>) -> Result<String> {
         let (pass, _) = self
             .users
             .get(user)
             .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
-        let exp = unix_now().as_millis() as u64 + TOKEN_EXPIRATION;
+        let exp = match expiration {
+            Some(0) => 0,
+            Some(v) => unix_now().as_millis() as u64 + v,
+            None => unix_now().as_millis() as u64 + TOKEN_EXPIRATION,
+        };
         let message = format!("{path}:{exp}");
         let mut signing_key = derive_secret_key(user, pass);
         let sig = signing_key.sign(message.as_bytes()).to_bytes();
@@ -182,7 +186,7 @@ impl AccessControl {
         let user_bytes = &raw[72..];
 
         let exp = u64::from_be_bytes(exp_bytes.try_into()?);
-        if unix_now().as_millis() as u64 > exp {
+        if exp != 0 && unix_now().as_millis() as u64 > exp {
             bail!("Token expired");
         }
 
