@@ -34,6 +34,7 @@ pub struct AccessControl {
     use_hashed_password: bool,
     users: IndexMap<String, (String, AccessPaths)>,
     anonymous: Option<AccessPaths>,
+    token_whitelist: IndexMap<String, AccessPaths>,
 }
 
 impl Default for AccessControl {
@@ -43,6 +44,7 @@ impl Default for AccessControl {
             use_hashed_password: false,
             users: IndexMap::new(),
             anonymous: Some(AccessPaths::new(AccessPerm::ReadWrite)),
+            token_whitelist: IndexMap::new(),
         }
     }
 }
@@ -99,11 +101,31 @@ impl AccessControl {
             use_hashed_password,
             users,
             anonymous,
+            token_whitelist: IndexMap::new(),
         })
     }
 
+    pub fn set_token_whitelist(&mut self, whitelist_rules: &[&str]) -> Result<()> {
+        for rule in whitelist_rules {
+            let (token, paths) = split_account_paths(rule)
+                .ok_or_else(|| anyhow!("Invalid token whitelist `{rule}`"))?;
+            if token.is_empty() {
+                bail!("Invalid token whitelist `{rule}`");
+            }
+            let mut access_paths = AccessPaths::default();
+            access_paths
+                .merge(paths)
+                .ok_or_else(|| anyhow!("Invalid token whitelist value `{token}@{paths}"))?;
+            self.token_whitelist.insert(token.to_string(), access_paths);
+        }
+        if self.empty && !self.token_whitelist.is_empty() {
+            self.empty = false;
+        }
+        Ok(())
+    }
+
     pub fn has_users(&self) -> bool {
-        !self.users.is_empty()
+        !self.users.is_empty() || !self.token_whitelist.is_empty()
     }
 
     pub fn guard(
@@ -116,6 +138,15 @@ impl AccessControl {
     ) -> (Option<String>, Option<AccessPaths>) {
         if self.empty {
             return (None, Some(AccessPaths::new(AccessPerm::ReadWrite)));
+        }
+
+        // Check token whitelist first
+        if method == Method::GET {
+            if let Some(token) = token {
+                if let Some(ap) = self.token_whitelist.get(token) {
+                    return (None, ap.guard(path, method));
+                }
+            }
         }
 
         if method == Method::GET {

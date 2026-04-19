@@ -89,6 +89,16 @@ pub fn build_cli() -> Command {
                 .value_name("rules"),
         )
         .arg(
+            Arg::new("auth-token-whitelist")
+                .env("DUFS_AUTH_TOKEN_WHITELIST")
+				.hide_env(true)
+                .long("auth-token-whitelist")
+                .help("Add token whitelist for GET access, e.g. token1@/:rw,token2@/dir1:ro")
+                .action(ArgAction::Append)
+                .value_delimiter(',')
+                .value_name("rules"),
+        )
+        .arg(
             Arg::new("auth-method")
                 .hide(true)
                 .env("DUFS_AUTH_METHOD")
@@ -283,6 +293,9 @@ pub struct Args {
     pub hidden: Vec<String>,
     #[serde(deserialize_with = "deserialize_access_control")]
     pub auth: AccessControl,
+    #[serde(deserialize_with = "deserialize_token_whitelist", default)]
+    #[serde(rename = "auth-token-whitelist")]
+    pub token_whitelist: Option<Vec<String>>,
     pub allow_all: bool,
     pub allow_upload: bool,
     pub allow_delete: bool,
@@ -364,6 +377,14 @@ impl Args {
         if let Some(rules) = matches.get_many::<String>("auth") {
             let rules: Vec<_> = rules.map(|v| v.as_str()).collect();
             args.auth = AccessControl::new(&rules)?;
+        }
+
+        if let Some(whitelist) = matches.get_many::<String>("auth-token-whitelist") {
+            let whitelist: Vec<_> = whitelist.map(|v| v.as_str()).collect();
+            args.auth.set_token_whitelist(&whitelist)?;
+        } else if let Some(whitelist) = &args.token_whitelist {
+            let whitelist: Vec<_> = whitelist.iter().map(|v| v.as_str()).collect();
+            args.auth.set_token_whitelist(&whitelist)?;
         }
 
         if !args.allow_all {
@@ -610,6 +631,18 @@ where
 {
     let rules: Vec<&str> = Vec::deserialize(deserializer)?;
     AccessControl::new(&rules).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_token_whitelist<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let whitelist: Vec<String> = Vec::deserialize(deserializer)?;
+    if whitelist.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(whitelist))
+    }
 }
 
 fn deserialize_log_http<'de, D>(deserializer: D) -> Result<HttpLogger, D::Error>

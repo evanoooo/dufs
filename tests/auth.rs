@@ -394,3 +394,76 @@ fn token_auth(#[with(&["-a", "user:pass@/"])] server: TestServer) -> Result<(), 
     assert_eq!(resp.status(), 200);
     Ok(())
 }
+
+#[rstest]
+fn token_whitelist(
+    #[with(&["-a", "user:pass@/:rw", "--auth-token-whitelist", "mytoken1@/:rw,mytoken2@/dir1:ro"])]
+    server: TestServer,
+) -> Result<(), Error> {
+    // Whitelist token grants full access
+    let url = format!("{}index.html?token=mytoken1", server.url());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 200);
+
+    // Whitelist token with rw can upload
+    let file_url = format!("{}file1", server.url());
+    let resp = fetch!(b"PUT", &file_url).body(b"abc".to_vec()).send()?;
+    assert_eq!(resp.status(), 201);
+
+    // Whitelist token with ro on dir1 can read
+    let url = format!("{}dir1/test.txt?token=mytoken2", server.url());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 200);
+
+    // Whitelist token with ro on dir1 cannot upload
+    let file_url = format!("{}dir1/new.txt?token=mytoken2", server.url());
+    let resp = fetch!(b"PUT", &file_url).body(b"abc".to_vec()).send()?;
+    assert_eq!(resp.status(), 403);
+
+    Ok(())
+}
+
+#[rstest]
+fn token_whitelist_no_auth(
+    #[with(&["-A", "--auth-token-whitelist", "pubtoken@/:ro"])] server: TestServer,
+) -> Result<(), Error> {
+    // Whitelist-only setup: no auth required for GET with valid token
+    let url = format!("{}index.html?token=pubtoken", server.url());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 200);
+
+    // Without token, should be 401 (no anonymous access configured)
+    let url = format!("{}index.html", server.url());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 401);
+
+    Ok(())
+}
+
+#[rstest]
+fn token_whitelist_path_restriction(
+    #[with(&["-a", "admin:admin@/:rw", "--auth-token-whitelist", "restricted@/dir1:ro,/dir2:rw"])]
+    server: TestServer,
+) -> Result<(), Error> {
+    // Can access dir1
+    let url = format!("{}dir1/test.txt?token=restricted", server.url());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 200);
+
+    // Cannot access root
+    let url = format!("{}index.html?token=restricted", server.url());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 404);
+
+    // Can upload to dir2 (rw)
+    let file_url = format!("{}dir2/new.txt?token=restricted", server.url());
+    let resp = fetch!(b"PUT", &file_url).body(b"abc".to_vec()).send()?;
+    assert_eq!(resp.status(), 201);
+
+    // Cannot upload to dir1 (ro)
+    let file_url = format!("{}dir1/new.txt?token=restricted", server.url());
+    let resp = fetch!(b"PUT", &file_url).body(b"abc".to_vec()).send()?;
+    assert_eq!(resp.status(), 403);
+
+    Ok(())
+}
