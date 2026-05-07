@@ -245,7 +245,8 @@ impl Server {
                 self.handle_send_file(&self.args.serve_path, headers, head_only, &mut res)
                     .await?;
             } else {
-                status_not_found(&mut res);
+                self.handle_not_found(&query_params, headers, head_only, &mut res)
+                    .await?;
             }
             return Ok(res);
         }
@@ -272,8 +273,9 @@ impl Server {
         let render_spa = self.args.render_spa;
         let render_try_index = self.args.render_try_index;
 
-        if !self.args.allow_symlink && !is_miss && !self.is_root_contained(path).await {
-            status_not_found(&mut res);
+        if self.guard_root_contained(path).await {
+            self.handle_not_found(&query_params, headers, head_only, &mut res)
+                .await?;
             return Ok(res);
         }
 
@@ -283,7 +285,8 @@ impl Server {
                     if render_try_index {
                         if allow_archive && has_query_flag(&query_params, "zip") {
                             if !allow_archive {
-                                status_not_found(&mut res);
+                                self.handle_not_found(&query_params, headers, head_only, &mut res)
+                                    .await?;
                                 return Ok(res);
                             }
                             self.handle_zip_dir(path, head_only, access_paths, &mut res)
@@ -351,7 +354,9 @@ impl Server {
                         .await?;
                     }
                 } else if is_file {
-                    if has_query_flag(&query_params, "edit") {
+                    if has_query_flag(&query_params, "json") {
+                        self.handle_file_json(path, head_only, &mut res).await?;
+                    } else if has_query_flag(&query_params, "edit") {
                         self.handle_edit_file(path, DataKind::Edit, head_only, user, &mut res)
                             .await?;
                     } else if has_query_flag(&query_params, "view") {
@@ -368,7 +373,7 @@ impl Server {
                             .await?;
                     }
                 } else if render_spa {
-                    self.handle_render_spa(path, headers, head_only, &mut res)
+                    self.handle_render_spa(path, &query_params, headers, head_only, &mut res)
                         .await?;
                 } else if allow_upload && req_path.ends_with('/') {
                     self.handle_ls_dir(
@@ -382,7 +387,8 @@ impl Server {
                     )
                     .await?;
                 } else {
-                    status_not_found(&mut res);
+                    self.handle_not_found(&query_params, headers, head_only, &mut res)
+                        .await?;
                 }
             }
             Method::OPTIONS => {
@@ -579,7 +585,7 @@ impl Server {
         res: &mut Response,
     ) -> Result<()> {
         let mut paths = vec![];
-        if exist {
+        if !head_only && exist {
             paths = match self.list_dir(path, path, access_paths.clone()).await {
                 Ok(paths) => paths,
                 Err(_) => {
@@ -618,14 +624,15 @@ impl Server {
             return self
                 .handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
                 .await;
-        } else {
+        }
+
+        if !head_only {
             let path_buf = path.to_path_buf();
             let hidden = Arc::new(self.args.hidden.to_vec());
             let search = search.clone();
 
-            let access_paths = access_paths.clone();
             let search_paths = tokio::spawn(collect_dir_entries(
-                access_paths,
+                access_paths.clone(),
                 self.running.clone(),
                 path_buf,
                 hidden,
@@ -724,14 +731,41 @@ impl Server {
             self.handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
                 .await?;
         } else {
-            status_not_found(res)
+            self.handle_not_found(query_params, headers, head_only, res)
+                .await?;
         }
+        Ok(())
+    }
+
+    async fn handle_file_json(
+        &self,
+        path: &Path,
+        head_only: bool,
+        res: &mut Response,
+    ) -> Result<()> {
+        let pathitem = match self.to_pathitem(path, &self.args.serve_path).await? {
+            Some(v) => v,
+            None => {
+                status_not_found(res);
+                return Ok(());
+            }
+        };
+        let output = serde_json::to_string_pretty(&pathitem)?;
+        res.headers_mut()
+            .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+        res.headers_mut()
+            .typed_insert(ContentLength(output.len() as u64));
+        if head_only {
+            return Ok(());
+        }
+        *res.body_mut() = body_full(output);
         Ok(())
     }
 
     async fn handle_render_spa(
         &self,
         path: &Path,
+        query_params: &HashMap<String, String>,
         headers: &HeaderMap<HeaderValue>,
         head_only: bool,
         res: &mut Response,
@@ -741,8 +775,28 @@ impl Server {
             self.handle_send_file(&path, headers, head_only, res)
                 .await?;
         } else {
-            status_not_found(res)
+            self.handle_not_found(query_params, headers, head_only, res)
+                .await?;
         }
+        Ok(())
+    }
+
+    async fn handle_not_found(
+        &self,
+        query_params: &HashMap<String, String>,
+        headers: &HeaderMap<HeaderValue>,
+        head_only: bool,
+        res: &mut Response,
+    ) -> Result<()> {
+        if let Some(error_page) = &self.args.error_page {
+            if !has_query_flag(query_params, "noscript") {
+                self.handle_send_file(error_page, headers, head_only, res)
+                    .await?;
+                *res.status_mut() = StatusCode::NOT_FOUND;
+                return Ok(());
+            }
+        }
+        status_not_found(res);
         Ok(())
     }
 
@@ -1126,6 +1180,11 @@ impl Server {
 
         ensure_path_parent(&dest).await?;
 
+        if self.guard_root_contained(&dest).await {
+            status_bad_request(res, "Invalid Destination");
+            return Ok(());
+        }
+
         fs::copy(path, &dest).await?;
 
         status_no_content(res);
@@ -1141,6 +1200,11 @@ impl Server {
         };
 
         ensure_path_parent(&dest).await?;
+
+        if self.guard_root_contained(&dest).await {
+            status_bad_request(res, "Invalid Destination");
+            return Ok(());
+        }
 
         fs::rename(path, &dest).await?;
 
@@ -1221,10 +1285,11 @@ impl Server {
             let output = paths
                 .into_iter()
                 .map(|v| {
+                    let displayname = escape_str_pcdata(&v.name);
                     if v.is_dir() {
-                        format!("{}/\n", v.name)
+                        format!("{}/\n", displayname)
                     } else {
-                        format!("{}\n", v.name)
+                        format!("{}\n", displayname)
                     }
                 })
                 .collect::<Vec<String>>()
@@ -1298,6 +1363,21 @@ impl Server {
         www_authenticate(res, &self.args)?;
         *res.status_mut() = StatusCode::UNAUTHORIZED;
         Ok(())
+    }
+
+    async fn guard_root_contained(&self, path: &Path) -> bool {
+        if self.args.allow_symlink {
+            return false;
+        }
+        let path = if !fs::try_exists(path).await.unwrap_or_default() {
+            match path.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => return true,
+            }
+        } else {
+            path.to_path_buf()
+        };
+        !self.is_root_contained(path.as_path()).await
     }
 
     async fn is_root_contained(&self, path: &Path) -> bool {
@@ -1816,14 +1896,10 @@ async fn get_content_type(path: &Path) -> Result<String> {
     let mime = mime_guess::from_path(path).first();
     let is_text = content_inspector::inspect(&buffer).is_text();
     let content_type = if is_text {
-        let mut detector = chardetng::EncodingDetector::new();
+        let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
         detector.feed(&buffer, buffer.len() < 1024);
-        let (enc, confident) = detector.guess_assess(None, true);
-        let charset = if confident {
-            format!("; charset={}", enc.name())
-        } else {
-            "".into()
-        };
+        let enc = detector.guess(None, chardetng::Utf8Detection::Allow);
+        let charset = format!("; charset={}", enc.name());
         match mime {
             Some(m) => format!("{m}{charset}"),
             None => format!("text/plain{charset}"),
@@ -1867,7 +1943,7 @@ async fn sha256_file(path: &Path) -> Result<String> {
     }
 
     let result = hasher.finalize();
-    Ok(format!("{result:x}"))
+    Ok(hex::encode(result))
 }
 
 fn has_query_flag(query_params: &HashMap<String, String>, name: &str) -> bool {
