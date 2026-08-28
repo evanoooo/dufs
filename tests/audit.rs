@@ -163,3 +163,21 @@ fn audit_anonymous_forbidden_when_auth_configured(
 
     Ok(())
 }
+
+#[rstest]
+fn audit_with_path_prefix_and_subpath_auth(
+    #[with(&["--allow-audit", "--path-prefix", "e635d75b-cef4-436d-aff2-ca1a906d2a81", "--auth", "opm:opm@/public:rw", "--auth", "@/"])] server: TestServer,
+) -> Result<(), Error> {
+    let audit_url = format!("{}e635d75b-cef4-436d-aff2-ca1a906d2a81/__dufs__/api/audit/stats", server.url());
+    // 1. Without auth -> 401
+    let resp = reqwest::blocking::get(&audit_url)?;
+    assert_eq!(resp.status(), 401);
+
+    // 2. With auth -> 200 OK
+    let resp = fetch!(b"GET", &audit_url)
+        .header("Authorization", "Basic b3BtOm9wbQ==")
+        .send()?;
+    assert_eq!(resp.status(), 200);
+
+    Ok(())
+}
