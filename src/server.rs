@@ -1041,6 +1041,10 @@ impl Server {
                     let path = assets_path.join(name);
                     if path.exists() {
                         self.handle_send_file(&path, headers, false, res).await?;
+                    } else if name == "favicon.ico" {
+                        *res.body_mut() = body_full(FAVICON_ICO);
+                        res.headers_mut()
+                            .insert("content-type", HeaderValue::from_static("image/x-icon"));
                     } else {
                         status_not_found(res);
                         return Ok(true);
@@ -1080,6 +1084,19 @@ impl Server {
                 HeaderValue::from_static("nosniff"),
             );
             Ok(true)
+        } else if req_path == "favicon.ico" {
+            let root_has_custom = self.args.serve_path.join("favicon.ico").exists();
+            if !root_has_custom {
+                *res.body_mut() = body_full(FAVICON_ICO);
+                res.headers_mut()
+                    .insert("content-type", HeaderValue::from_static("image/x-icon"));
+                res.headers_mut().insert(
+                    "cache-control",
+                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                );
+                return Ok(true);
+            }
+            Ok(false)
         } else if req_path == HEALTH_CHECK_PATH {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
