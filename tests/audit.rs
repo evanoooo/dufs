@@ -181,3 +181,28 @@ fn audit_with_path_prefix_and_subpath_auth(
 
     Ok(())
 }
+
+#[rstest]
+fn audit_records_x_real_ip(#[with(&["--allow-audit", "--allow-upload"])] server: TestServer) -> Result<(), Error> {
+    let upload_url = format!("{}test_ip.txt", server.url());
+    let resp = fetch!(b"PUT", &upload_url)
+        .header("X-Real-IP", "198.51.100.42")
+        .body("hello world")
+        .send()?;
+    assert_eq!(resp.status(), 201);
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let audit_url = format!("{}__dufs__/api/audit", server.url());
+    let resp = reqwest::blocking::get(&audit_url)?;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    let records = body["data"].as_array().unwrap();
+    let record = records
+        .iter()
+        .find(|r| r["path"] == "test_ip.txt")
+        .expect("upload record not found");
+    assert_eq!(record["ip"], "198.51.100.42");
+
+    Ok(())
+}

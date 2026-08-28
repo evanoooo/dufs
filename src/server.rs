@@ -115,9 +115,23 @@ impl Server {
         let assets_prefix = &self.assets_prefix;
         let enable_cors = self.args.enable_cors;
         let mut http_log_data = self.args.http_logger.data(&req);
-        if let Some(addr) = addr {
-            http_log_data.insert("remote_addr".to_string(), addr.ip().to_string());
-        }
+        let remote_ip = req
+            .headers()
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                req.headers()
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.split(',').next())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| addr.map(|a| a.ip().to_string()))
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        http_log_data.insert("remote_addr".to_string(), remote_ip);
 
         let mut res = match self.clone().handle(req, addr).await {
             Ok(res) => {
@@ -170,8 +184,20 @@ impl Server {
             .map(|v| v.to_lowercase())
             .unwrap_or_default();
 
-        let remote_ip = addr
-            .map(|a| a.ip().to_string())
+        let remote_ip = headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.split(',').next())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| addr.map(|a| a.ip().to_string()))
             .unwrap_or_else(|| "127.0.0.1".to_string());
 
         let query = req.uri().query().unwrap_or_default();
