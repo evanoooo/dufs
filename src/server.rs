@@ -1,10 +1,11 @@
 #![allow(clippy::too_many_arguments)]
 
+use crate::args::Args;
+use crate::audit::{AuditAction, AuditFilter, AuditManager, AuditRecord, AuditStatus};
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{decode_uri, encode_uri, get_file_name, glob, parse_range, try_get_file_name};
-use crate::Args;
 
 use anyhow::{anyhow, Result};
 use async_deflate_zip::{Compression, WriterOptions, ZipWriter};
@@ -68,6 +69,7 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+    pub audit: Arc<AuditManager>,
 }
 
 impl Server {
@@ -90,12 +92,17 @@ impl Server {
             Some(path) => Cow::Owned(std::fs::read_to_string(path.join("index.html"))?),
             None => Cow::Borrowed(INDEX_HTML),
         };
+        let audit = Arc::new(AuditManager::new(
+            args.audit_max_records,
+            args.audit_file.clone(),
+        ));
         Ok(Self {
             args,
             running,
             single_file_req_paths,
             assets_prefix,
             html,
+            audit,
         })
     }
 
@@ -112,7 +119,7 @@ impl Server {
             http_log_data.insert("remote_addr".to_string(), addr.ip().to_string());
         }
 
-        let mut res = match self.clone().handle(req).await {
+        let mut res = match self.clone().handle(req, addr).await {
             Ok(res) => {
                 http_log_data.insert("status".to_string(), res.status().as_u16().to_string());
                 if !uri.path().starts_with(assets_prefix) {
@@ -138,7 +145,11 @@ impl Server {
         Ok(res)
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request) -> Result<Response> {
+    pub async fn handle(
+        self: Arc<Self>,
+        req: Request,
+        addr: Option<SocketAddr>,
+    ) -> Result<Response> {
         let mut res = Response::default();
 
         let req_path = req.uri().path();
@@ -153,19 +164,27 @@ impl Server {
             }
         };
 
-        if method == Method::GET
-            && self
-                .handle_internal(&relative_path, headers, &mut res)
-                .await?
-        {
-            return Ok(res);
-        }
-
         let user_agent = headers
             .get("user-agent")
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_lowercase())
             .unwrap_or_default();
+
+        let remote_ip = addr
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+
+        let query = req.uri().query().unwrap_or_default();
+        let mut query_params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        if self
+            .handle_internal(&relative_path, &query_params, &method, headers, &mut res)
+            .await?
+        {
+            return Ok(res);
+        }
 
         let is_microsoft_webdav = user_agent.starts_with("microsoft-webdav-miniredir/");
 
@@ -177,11 +196,6 @@ impl Server {
 
         let authorization = headers.get(AUTHORIZATION);
 
-        let query = req.uri().query().unwrap_or_default();
-        let mut query_params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-
         let guard = self.args.auth.guard(
             &relative_path,
             &method,
@@ -192,10 +206,34 @@ impl Server {
 
         let (user, access_paths) = match guard {
             (None, None) => {
+                self.audit_record(
+                    None,
+                    &remote_ip,
+                    Some(&user_agent),
+                    AuditAction::AuthFail,
+                    &relative_path,
+                    None,
+                    AuditStatus::Failed,
+                    401,
+                    None,
+                    Some("Unauthorized"),
+                );
                 self.auth_reject(&mut res)?;
                 return Ok(res);
             }
-            (Some(_), None) => {
+            (Some(u), None) => {
+                self.audit_record(
+                    Some(&u),
+                    &remote_ip,
+                    Some(&user_agent),
+                    AuditAction::AuthFail,
+                    &relative_path,
+                    None,
+                    AuditStatus::Failed,
+                    403,
+                    None,
+                    Some("Forbidden"),
+                );
                 status_forbid(&mut res);
                 return Ok(res);
             }
@@ -209,10 +247,34 @@ impl Server {
         if method.as_str() == "CHECKAUTH" {
             match user.clone() {
                 Some(user) => {
+                    self.audit_record(
+                        Some(&user),
+                        &remote_ip,
+                        Some(&user_agent),
+                        AuditAction::Login,
+                        &relative_path,
+                        None,
+                        AuditStatus::Success,
+                        200,
+                        None,
+                        None,
+                    );
                     *res.body_mut() = body_full(user);
                 }
                 None => {
                     if has_query_flag(&query_params, "login") || !access_paths.perm().readwrite() {
+                        self.audit_record(
+                            None,
+                            &remote_ip,
+                            Some(&user_agent),
+                            AuditAction::AuthFail,
+                            &relative_path,
+                            None,
+                            AuditStatus::Failed,
+                            401,
+                            None,
+                            Some("Login failed"),
+                        );
                         self.auth_reject(&mut res)?
                     } else {
                         *res.body_mut() = body_full("");
@@ -367,6 +429,20 @@ impl Server {
                     } else {
                         self.handle_send_file(path, headers, head_only, &mut res)
                             .await?;
+                        if res.status().is_success() || res.status() == StatusCode::PARTIAL_CONTENT {
+                            self.audit_record(
+                                user.as_deref(),
+                                &remote_ip,
+                                Some(&user_agent),
+                                AuditAction::Download,
+                                &relative_path,
+                                None,
+                                AuditStatus::Success,
+                                res.status().as_u16(),
+                                Some(size),
+                                None,
+                            );
+                        }
                     }
                 } else if render_spa {
                     self.handle_render_spa(path, &query_params, headers, head_only, &mut res)
@@ -392,15 +468,50 @@ impl Server {
             }
             Method::PUT => {
                 if is_dir || !allow_upload || (!allow_delete && size > 0) {
+                    self.audit_record(
+                        user.as_deref(),
+                        &remote_ip,
+                        Some(&user_agent),
+                        AuditAction::Upload,
+                        &relative_path,
+                        None,
+                        AuditStatus::Failed,
+                        403,
+                        Some(size),
+                        Some("Upload forbidden"),
+                    );
                     status_forbid(&mut res);
                 } else {
-                    self.handle_upload(path, None, size, req, &mut res).await?;
+                    self.handle_upload(
+                        path,
+                        &relative_path,
+                        user.as_deref(),
+                        &remote_ip,
+                        Some(&user_agent),
+                        None,
+                        size,
+                        req,
+                        &mut res,
+                    )
+                    .await?;
                 }
             }
             Method::PATCH => {
                 if is_miss {
                     status_not_found(&mut res);
                 } else if !allow_upload {
+                    self.audit_record(
+                        user.as_deref(),
+                        &remote_ip,
+                        Some(&user_agent),
+                        AuditAction::Upload,
+                        &relative_path,
+                        None,
+                        AuditStatus::Failed,
+                        403,
+                        Some(size),
+                        Some("Upload forbidden"),
+                    );
                     status_forbid(&mut res);
                 } else {
                     let offset = match parse_upload_offset(headers, size) {
@@ -416,8 +527,18 @@ impl Server {
                                 status_forbid(&mut res);
                                 return Ok(res);
                             }
-                            self.handle_upload(path, Some(offset), size, req, &mut res)
-                                .await?;
+                            self.handle_upload(
+                                path,
+                                &relative_path,
+                                user.as_deref(),
+                                &remote_ip,
+                                Some(&user_agent),
+                                Some(offset),
+                                size,
+                                req,
+                                &mut res,
+                            )
+                            .await?;
                         }
                         None => {
                             *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
@@ -427,9 +548,30 @@ impl Server {
             }
             Method::DELETE => {
                 if !allow_delete {
+                    self.audit_record(
+                        user.as_deref(),
+                        &remote_ip,
+                        Some(&user_agent),
+                        AuditAction::Delete,
+                        &relative_path,
+                        None,
+                        AuditStatus::Failed,
+                        403,
+                        None,
+                        Some("Delete forbidden"),
+                    );
                     status_forbid(&mut res);
                 } else if !is_miss {
-                    self.handle_delete(path, is_dir, &mut res).await?
+                    self.handle_delete(
+                        path,
+                        &relative_path,
+                        user.as_deref(),
+                        &remote_ip,
+                        Some(&user_agent),
+                        is_dir,
+                        &mut res,
+                    )
+                    .await?
                 } else {
                     status_not_found(&mut res);
                 }
@@ -461,12 +603,32 @@ impl Server {
                 }
                 "MKCOL" => {
                     if !allow_upload {
+                        self.audit_record(
+                            user.as_deref(),
+                            &remote_ip,
+                            Some(&user_agent),
+                            AuditAction::Mkdir,
+                            &relative_path,
+                            None,
+                            AuditStatus::Failed,
+                            403,
+                            None,
+                            Some("Mkdir forbidden"),
+                        );
                         status_forbid(&mut res);
                     } else if !is_miss {
                         *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
                         *res.body_mut() = body_full("Already exists");
                     } else {
-                        self.handle_mkcol(path, &mut res).await?;
+                        self.handle_mkcol(
+                            path,
+                            &relative_path,
+                            user.as_deref(),
+                            &remote_ip,
+                            Some(&user_agent),
+                            &mut res,
+                        )
+                        .await?;
                     }
                 }
                 "COPY" => {
@@ -475,7 +637,16 @@ impl Server {
                     } else if is_miss {
                         status_not_found(&mut res);
                     } else {
-                        self.handle_copy(path, &req, &mut res).await?
+                        self.handle_copy(
+                            path,
+                            &relative_path,
+                            user.as_deref(),
+                            &remote_ip,
+                            Some(&user_agent),
+                            &req,
+                            &mut res,
+                        )
+                        .await?
                     }
                 }
                 "MOVE" => {
@@ -484,7 +655,16 @@ impl Server {
                     } else if is_miss {
                         status_not_found(&mut res);
                     } else {
-                        self.handle_move(path, &req, &mut res).await?
+                        self.handle_move(
+                            path,
+                            &relative_path,
+                            user.as_deref(),
+                            &remote_ip,
+                            Some(&user_agent),
+                            &req,
+                            &mut res,
+                        )
+                        .await?
                     }
                 }
                 "LOCK" => {
@@ -513,6 +693,10 @@ impl Server {
     async fn handle_upload(
         &self,
         path: &Path,
+        rel_path: &str,
+        user: Option<&str>,
+        remote_ip: &str,
+        user_agent: Option<&str>,
         upload_offset: Option<u64>,
         size: u64,
         req: Request,
@@ -547,15 +731,49 @@ impl Server {
             if upload_offset.is_none() && size < RESUMABLE_UPLOAD_MIN_SIZE {
                 let _ = tokio::fs::remove_file(&path).await;
             }
+            self.audit_record(
+                user,
+                remote_ip,
+                user_agent,
+                AuditAction::Upload,
+                rel_path,
+                None,
+                AuditStatus::Failed,
+                500,
+                Some(size),
+                Some("Upload failed"),
+            );
             ret?;
         }
+
+        self.audit_record(
+            user,
+            remote_ip,
+            user_agent,
+            AuditAction::Upload,
+            rel_path,
+            None,
+            AuditStatus::Success,
+            status.as_u16(),
+            Some(size),
+            None,
+        );
 
         *res.status_mut() = status;
 
         Ok(())
     }
 
-    async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> Result<()> {
+    async fn handle_delete(
+        &self,
+        path: &Path,
+        rel_path: &str,
+        user: Option<&str>,
+        remote_ip: &str,
+        user_agent: Option<&str>,
+        is_dir: bool,
+        res: &mut Response,
+    ) -> Result<()> {
         let path_str = path.to_string_lossy().to_string();
         let final_path = if is_dir && !path_str.ends_with('/') && !path_str.ends_with('\\') {
             info!("handle_delete: {path_str}");
@@ -567,6 +785,18 @@ impl Server {
             true => fs::remove_dir(final_path).await?,
             false => fs::remove_file(final_path).await?,
         }
+        self.audit_record(
+            user,
+            remote_ip,
+            user_agent,
+            AuditAction::Delete,
+            rel_path,
+            None,
+            AuditStatus::Success,
+            204,
+            None,
+            None,
+        );
         status_no_content(res);
         Ok(())
     }
@@ -800,6 +1030,8 @@ impl Server {
     async fn handle_internal(
         &self,
         req_path: &str,
+        query_params: &HashMap<String, String>,
+        method: &Method,
         headers: &HeaderMap<HeaderValue>,
         res: &mut Response,
     ) -> Result<bool> {
@@ -854,6 +1086,93 @@ impl Server {
 
             *res.body_mut() = body_full(r#"{"status":"OK"}"#);
             Ok(true)
+        } else if let Some(api_sub) = req_path.strip_prefix("__dufs__/api/audit") {
+            if !self.args.allow_audit {
+                status_forbid(res);
+                return Ok(true);
+            }
+            if self.args.auth.has_users() {
+                let authorization = headers.get(AUTHORIZATION);
+                let (user, access_paths) = self.args.auth.guard(
+                    "",
+                    &Method::GET,
+                    authorization,
+                    query_params.get("token"),
+                    false,
+                );
+                let is_admin = user.is_some() && access_paths.map(|ap| ap.perm().readwrite()).unwrap_or(false);
+                if !is_admin {
+                    if authorization.is_none() {
+                        self.auth_reject(res)?;
+                    } else {
+                        status_forbid(res);
+                    }
+                    return Ok(true);
+                }
+            }
+            let sub = api_sub.trim_start_matches('/');
+            match sub {
+                "" => {
+                    let filter = parse_audit_filter(query_params);
+                    let result = self.audit.query(&filter).await;
+                    res.headers_mut()
+                        .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+                    res.headers_mut()
+                        .typed_insert(CacheControl::new().with_no_cache());
+                    *res.body_mut() = body_full(serde_json::to_string(&result)?);
+                    Ok(true)
+                }
+                "stats" => {
+                    let since_ms = query_params
+                        .get("since")
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or_else(|| {
+                            let now = Utc::now();
+                            now.date_naive()
+                                .and_hms_opt(0, 0, 0)
+                                .map(|dt| dt.and_utc().timestamp_millis())
+                                .unwrap_or(0)
+                        });
+                    let stats = self.audit.stats(since_ms).await;
+                    res.headers_mut()
+                        .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+                    res.headers_mut()
+                        .typed_insert(CacheControl::new().with_no_cache());
+                    *res.body_mut() = body_full(serde_json::to_string(&stats)?);
+                    Ok(true)
+                }
+                "export" => {
+                    let filter = parse_audit_filter(query_params);
+                    let csv = self.audit.export_csv(&filter).await;
+                    res.headers_mut().insert(
+                        CONTENT_DISPOSITION,
+                        HeaderValue::from_static("attachment; filename=\"audit.csv\""),
+                    );
+                    res.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/csv; charset=UTF-8"),
+                    );
+                    res.headers_mut()
+                        .typed_insert(CacheControl::new().with_no_cache());
+                    *res.body_mut() = body_full(csv);
+                    Ok(true)
+                }
+                "clear" => {
+                    if method != Method::POST {
+                        *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                        return Ok(true);
+                    }
+                    self.audit.clear().await;
+                    res.headers_mut()
+                        .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+                    *res.body_mut() = body_full(r#"{"status":"OK"}"#);
+                    Ok(true)
+                }
+                _ => {
+                    status_not_found(res);
+                    Ok(true)
+                }
+            }
         } else {
             Ok(false)
         }
@@ -1154,14 +1473,42 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_mkcol(&self, path: &Path, res: &mut Response) -> Result<()> {
-        // 2. 不存在则创建
+    async fn handle_mkcol(
+        &self,
+        path: &Path,
+        rel_path: &str,
+        user: Option<&str>,
+        remote_ip: &str,
+        user_agent: Option<&str>,
+        res: &mut Response,
+    ) -> Result<()> {
         fs::create_dir_all(path).await?;
+        self.audit_record(
+            user,
+            remote_ip,
+            user_agent,
+            AuditAction::Mkdir,
+            rel_path,
+            None,
+            AuditStatus::Success,
+            201,
+            None,
+            None,
+        );
         *res.status_mut() = StatusCode::CREATED;
         Ok(())
     }
 
-    async fn handle_copy(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
+    async fn handle_copy(
+        &self,
+        path: &Path,
+        rel_path: &str,
+        user: Option<&str>,
+        remote_ip: &str,
+        user_agent: Option<&str>,
+        req: &Request,
+        res: &mut Response,
+    ) -> Result<()> {
         let dest = match self.extract_dest(req, res) {
             Some(dest) => dest,
             None => {
@@ -1184,11 +1531,38 @@ impl Server {
 
         fs::copy(path, &dest).await?;
 
+        let dest_rel = dest
+            .strip_prefix(&self.args.serve_path)
+            .ok()
+            .map(normalize_path);
+
+        self.audit_record(
+            user,
+            remote_ip,
+            user_agent,
+            AuditAction::Copy,
+            rel_path,
+            dest_rel.as_deref(),
+            AuditStatus::Success,
+            204,
+            None,
+            None,
+        );
+
         status_no_content(res);
         Ok(())
     }
 
-    async fn handle_move(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
+    async fn handle_move(
+        &self,
+        path: &Path,
+        rel_path: &str,
+        user: Option<&str>,
+        remote_ip: &str,
+        user_agent: Option<&str>,
+        req: &Request,
+        res: &mut Response,
+    ) -> Result<()> {
         let dest = match self.extract_dest(req, res) {
             Some(dest) => dest,
             None => {
@@ -1204,6 +1578,24 @@ impl Server {
         }
 
         fs::rename(path, &dest).await?;
+
+        let dest_rel = dest
+            .strip_prefix(&self.args.serve_path)
+            .ok()
+            .map(normalize_path);
+
+        self.audit_record(
+            user,
+            remote_ip,
+            user_agent,
+            AuditAction::Move,
+            rel_path,
+            dest_rel.as_deref(),
+            AuditStatus::Success,
+            204,
+            None,
+            None,
+        );
 
         status_no_content(res);
         Ok(())
@@ -1306,6 +1698,8 @@ impl Server {
             normalize_path(path.strip_prefix(&self.args.serve_path)?)
         );
         let readwrite = access_paths.perm().readwrite();
+        let allow_audit = self.args.allow_audit
+            && (!self.args.auth.has_users() || (user.is_some() && readwrite));
         let data = IndexData {
             kind: DataKind::Index,
             href,
@@ -1314,6 +1708,7 @@ impl Server {
             allow_delete: self.args.allow_delete && readwrite,
             allow_search: self.args.allow_search,
             allow_archive: self.args.allow_archive,
+            allow_audit,
             dir_exists: exist,
             auth: self.args.auth.has_users(),
             user,
@@ -1555,6 +1950,64 @@ impl Server {
             size,
         }))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn audit_record(
+        &self,
+        user: Option<&str>,
+        ip: &str,
+        user_agent: Option<&str>,
+        action: AuditAction,
+        path: &str,
+        target_path: Option<&str>,
+        status: AuditStatus,
+        status_code: u16,
+        size: Option<u64>,
+        message: Option<&str>,
+    ) {
+        if self.args.allow_audit {
+            let record = AuditRecord {
+                id: 0,
+                timestamp: Utc::now().timestamp_millis(),
+                user: user.map(|s| s.to_string()),
+                ip: ip.to_string(),
+                user_agent: user_agent.map(|s| s.to_string()),
+                action,
+                path: path.to_string(),
+                target_path: target_path.map(|s| s.to_string()),
+                status,
+                status_code,
+                size,
+                message: message.map(|s| s.to_string()),
+            };
+            let audit = self.audit.clone();
+            tokio::spawn(async move {
+                audit.record(record).await;
+            });
+        }
+    }
+}
+
+fn parse_audit_filter(query_params: &HashMap<String, String>) -> AuditFilter {
+    let page = query_params.get("page").and_then(|v| v.parse::<usize>().ok());
+    let page_size = query_params.get("page_size").and_then(|v| v.parse::<usize>().ok());
+    let action = query_params.get("action").cloned();
+    let status = query_params.get("status").cloned();
+    let user = query_params.get("user").cloned();
+    let q = query_params.get("q").cloned();
+    let start_time = query_params.get("start_time").and_then(|v| v.parse::<i64>().ok());
+    let end_time = query_params.get("end_time").and_then(|v| v.parse::<i64>().ok());
+
+    AuditFilter {
+        page,
+        page_size,
+        action,
+        status,
+        user,
+        q,
+        start_time,
+        end_time,
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -1573,6 +2026,7 @@ pub struct IndexData {
     pub allow_delete: bool,
     pub allow_search: bool,
     pub allow_archive: bool,
+    pub allow_audit: bool,
     pub dir_exists: bool,
     pub auth: bool,
     pub user: Option<String>,

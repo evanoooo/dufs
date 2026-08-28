@@ -157,6 +157,33 @@ pub fn build_cli() -> Command {
                 .help("Allow ?hash query to get file sha256 hash"),
         )
         .arg(
+            Arg::new("allow-audit")
+                .env("DUFS_ALLOW_AUDIT")
+                .hide_env(true)
+                .long("allow-audit")
+                .action(ArgAction::SetTrue)
+                .help("Enable audit logging feature"),
+        )
+        .arg(
+            Arg::new("audit-file")
+                .env("DUFS_AUDIT_FILE")
+                .hide_env(true)
+                .long("audit-file")
+                .value_name("file")
+                .value_parser(value_parser!(PathBuf))
+                .help("Specify the file to persist audit logs to"),
+        )
+        .arg(
+            Arg::new("audit-max-records")
+                .env("DUFS_AUDIT_MAX_RECORDS")
+                .hide_env(true)
+                .long("audit-max-records")
+                .value_name("num")
+                .value_parser(value_parser!(usize))
+                .default_value("10000")
+                .help("Maximum number of audit records to keep in memory"),
+        )
+        .arg(
             Arg::new("enable-cors")
                 .env("DUFS_ENABLE_CORS")
 				.hide_env(true)
@@ -290,6 +317,11 @@ pub struct Args {
     pub allow_symlink: bool,
     pub allow_archive: bool,
     pub allow_hash: bool,
+    pub allow_audit: bool,
+    pub audit_file: Option<PathBuf>,
+    #[serde(default = "default_audit_max_records")]
+    #[default(default_audit_max_records())]
+    pub audit_max_records: usize,
     pub render_index: bool,
     pub render_spa: bool,
     pub render_try_index: bool,
@@ -390,6 +422,15 @@ impl Args {
         }
         if !args.allow_archive {
             args.allow_archive = allow_all || matches.get_flag("allow-archive");
+        }
+        if !args.allow_audit {
+            args.allow_audit = allow_all || matches.get_flag("allow-audit");
+        }
+        if let Some(audit_file) = matches.get_one::<PathBuf>("audit-file") {
+            args.audit_file = Some(audit_file.clone());
+        }
+        if let Some(audit_max) = matches.get_one::<usize>("audit-max-records") {
+            args.audit_max_records = *audit_max;
         }
         if !args.render_index {
             args.render_index = matches.get_flag("render-index");
@@ -643,6 +684,10 @@ fn default_addrs() -> Vec<BindAddr> {
 
 fn default_port() -> u16 {
     5000
+}
+
+fn default_audit_max_records() -> usize {
+    10000
 }
 
 #[cfg(test)]
