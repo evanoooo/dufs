@@ -209,6 +209,35 @@ impl AccessControl {
         derive_secret_key(user, pass).verify(message.as_bytes(), &sig)?;
         Ok((user.to_string(), ap))
     }
+
+    pub fn check_user_is_rw(&self, authorization: Option<&HeaderValue>, method: &str) -> (Option<String>, bool) {
+        if self.empty {
+            return (Some("".to_string()), true);
+        }
+        if let Some(authorization) = authorization {
+            if let Some(user) = get_auth_user(authorization) {
+                if let Some((pass, ap)) = self.users.get(&user) {
+                    if check_auth(authorization, method, &user, pass).is_some() {
+                        let is_rw = ap.has_readwrite();
+                        return (Some(user), is_rw);
+                    }
+                }
+            }
+        }
+        (None, false)
+    }
+
+    pub fn user_has_rw(&self, user: Option<&str>) -> bool {
+        if self.empty {
+            return true;
+        }
+        if let Some(user) = user {
+            if let Some((_, ap)) = self.users.get(user) {
+                return ap.has_readwrite();
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -227,6 +256,13 @@ impl AccessPaths {
 
     pub fn perm(&self) -> AccessPerm {
         self.perm
+    }
+
+    pub fn has_readwrite(&self) -> bool {
+        if self.perm.readwrite() {
+            return true;
+        }
+        self.children.values().any(|c| c.has_readwrite())
     }
 
     pub fn set_perm(&mut self, perm: AccessPerm) {

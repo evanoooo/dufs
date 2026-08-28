@@ -1110,20 +1110,13 @@ impl Server {
             }
             if self.args.auth.has_users() {
                 let authorization = headers.get(AUTHORIZATION);
-                let (user, access_paths) = self.args.auth.guard(
-                    "",
-                    &Method::PUT,
-                    authorization,
-                    query_params.get("token"),
-                    false,
-                );
-                let is_rw = user.is_some() && access_paths.map(|ap| ap.perm().readwrite()).unwrap_or(false);
+                let (user, is_rw) = self.args.auth.check_user_is_rw(authorization, method.as_str());
+                if user.is_none() {
+                    self.auth_reject(res)?;
+                    return Ok(true);
+                }
                 if !is_rw {
-                    if authorization.is_none() {
-                        self.auth_reject(res)?;
-                    } else {
-                        status_forbid(res);
-                    }
+                    status_forbid(res);
                     return Ok(true);
                 }
             }
@@ -1715,8 +1708,9 @@ impl Server {
             normalize_path(path.strip_prefix(&self.args.serve_path)?)
         );
         let readwrite = access_paths.perm().readwrite();
+        let user_is_rw = self.args.auth.user_has_rw(user.as_deref());
         let allow_audit = self.args.allow_audit
-            && (!self.args.auth.has_users() || (user.is_some() && readwrite));
+            && (!self.args.auth.has_users() || user_is_rw);
         let data = IndexData {
             kind: DataKind::Index,
             href,
