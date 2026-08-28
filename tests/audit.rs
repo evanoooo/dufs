@@ -107,9 +107,11 @@ fn audit_index_data_flag(#[with(&["--allow-audit"])] server: TestServer) -> Resu
 fn audit_auth_failure_recorded(
     #[with(&["--allow-audit", "--auth", "admin:admin@/:rw"])] server: TestServer,
 ) -> Result<(), Error> {
-    // Attempt request without auth -> 401
+    // Attempt request with invalid auth -> 401
     let url = format!("{}secret.txt", server.url());
-    let resp = reqwest::blocking::get(&url)?;
+    let resp = fetch!(b"GET", &url)
+        .header("Authorization", "Basic d3Jvbmc6cGFzcw==")
+        .send()?;
     assert_eq!(resp.status(), 401);
 
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -203,6 +205,44 @@ fn audit_records_x_real_ip(#[with(&["--allow-audit", "--allow-upload"])] server:
         .find(|r| r["path"] == "test_ip.txt")
         .expect("upload record not found");
     assert_eq!(record["ip"], "198.51.100.42");
+
+    Ok(())
+}
+
+#[rstest]
+fn audit_range_download_deduplication(
+    #[with(&["--allow-audit", "--allow-upload"])] server: TestServer,
+) -> Result<(), Error> {
+    // 1. Upload a file
+    let upload_url = format!("{}range_test.bin", server.url());
+    fetch!(b"PUT", &upload_url)
+        .body(vec![0u8; 10000])
+        .send()?;
+
+    // 2. Perform multiple Range chunk requests
+    fetch!(b"GET", &upload_url)
+        .header("Range", "bytes=0-1000")
+        .send()?;
+    fetch!(b"GET", &upload_url)
+        .header("Range", "bytes=1001-2000")
+        .send()?;
+    fetch!(b"GET", &upload_url)
+        .header("Range", "bytes=2001-3000")
+        .send()?;
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // 3. Verify only 1 DOWNLOAD record exists for range_test.bin
+    let audit_url = format!("{}__dufs__/api/audit", server.url());
+    let resp = reqwest::blocking::get(&audit_url)?;
+    let body: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    let download_records: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["action"] == "DOWNLOAD" && r["path"] == "range_test.bin")
+        .collect();
+    assert_eq!(download_records.len(), 1);
 
     Ok(())
 }

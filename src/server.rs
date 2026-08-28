@@ -232,18 +232,20 @@ impl Server {
 
         let (user, access_paths) = match guard {
             (None, None) => {
-                self.audit_record(
-                    None,
-                    &remote_ip,
-                    Some(&user_agent),
-                    AuditAction::AuthFail,
-                    &relative_path,
-                    None,
-                    AuditStatus::Failed,
-                    401,
-                    None,
-                    Some("Unauthorized"),
-                );
+                if authorization.is_some() || query_params.contains_key("token") {
+                    self.audit_record(
+                        None,
+                        &remote_ip,
+                        Some(&user_agent),
+                        AuditAction::AuthFail,
+                        &relative_path,
+                        None,
+                        AuditStatus::Failed,
+                        401,
+                        None,
+                        Some("Unauthorized"),
+                    );
+                }
                 self.auth_reject(&mut res)?;
                 return Ok(res);
             }
@@ -455,7 +457,20 @@ impl Server {
                     } else {
                         self.handle_send_file(path, headers, head_only, &mut res)
                             .await?;
-                        if res.status().is_success() || res.status() == StatusCode::PARTIAL_CONTENT {
+                        let is_first_chunk = match headers.get("range").and_then(|v| v.to_str().ok()) {
+                            Some(range) => {
+                                let range = range.trim().to_lowercase();
+                                if let Some(bytes_part) = range.strip_prefix("bytes=") {
+                                    let start = bytes_part.split('-').next().unwrap_or("").trim();
+                                    start == "0" || start.is_empty()
+                                } else {
+                                    true
+                                }
+                            }
+                            None => true,
+                        };
+
+                        if res.status() == StatusCode::OK || (res.status() == StatusCode::PARTIAL_CONTENT && is_first_chunk) {
                             self.audit_record(
                                 user.as_deref(),
                                 &remote_ip,
